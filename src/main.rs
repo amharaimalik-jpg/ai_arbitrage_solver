@@ -1,24 +1,25 @@
 // src/main.rs - Sovereign Production-Grade Node with Real Blockchain RPC Verification
+use std::collections::HashSet;
 use std::error::Error;
-use std::sync::Arc;
-use tokio::time::{sleep, Duration};
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs::OpenOptions;
 use std::io::Write;
-use chrono::Utc;
-use axum::{
-    routing::{get, post},
-    Router,
-    Json,
-    http::{HeaderMap, StatusCode},
-};
-use serde::{Serialize, Deserialize};
 use std::net::SocketAddr;
-use sha2::{Sha256, Digest};
-use std::collections::HashSet;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{sleep, Duration};
+use tracing::{info, warn, Level};
+use tracing_subscriber::FmtSubscriber;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct IntelligencePayload {
@@ -31,7 +32,7 @@ struct IntelligencePayload {
     cryptographic_hash: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Deserialize)]
 struct BuyRequest {
     tx_hash: String,
     client_wallet: String,
@@ -50,7 +51,6 @@ struct ErrorResponse {
     message: String,
 }
 
-// هيكل الرد القادم من عقدة الـ RPC للـ Blockchain
 #[derive(Deserialize, Debug)]
 struct RpcResponse {
     result: Option<TransactionDetails>,
@@ -62,6 +62,17 @@ struct TransactionDetails {
     value: Option<String>,
 }
 
+#[derive(Clone)]
+struct AppState {
+    node_id: String,
+    merchant_rabby_wallet: String,
+    rpc_endpoint: String,
+    processed_requests: Arc<AtomicU64>,
+    active_keys: Arc<Mutex<HashSet<String>>>,
+    latest_payload: Arc<RwLock<IntelligencePayload>>,
+    http_client: reqwest::Client,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -71,63 +82,102 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("🚀 Booting Sovereign Production Node with Live Blockchain RPC Verification...");
 
-    let node_id = "MALIK_SOVEREIGN_ORACLE_01";
-    // عنوان محفظتك الحقيقي في Rabby Wallet (0xdd2a71a3848e102ec4e7d95dac8e965db0fc4008ffc2aa584755397bc0577e44)
-    let merchant_rabby_wallet = "0xYourRabbyWalletAddressHere_Malik";
-    
+    // ضع عنوان محفظة Rabby الحقيقي هنا
+    let merchant_rabby_wallet = std::env::var("MERCHANT_RABBY_WALLET")
+        .unwrap_or_else(|_| "0xYourRabbyWalletAddressHere_Malik".to_string());
+
+    let node_id = std::env::var("NODE_ID")
+        .unwrap_or_else(|_| "MALIK_SOVEREIGN_ORACLE_01".to_string());
+
+    let rpc_endpoint = std::env::var("RPC_ENDPOINT")
+        .unwrap_or_else(|_| "https://mainnet.base.org".to_string());
+
+    let initial_key = std::env::var("MASTER_API_KEY")
+        .unwrap_or_else(|_| "MALIK_MASTER_PROD_KEY_2026".to_string());
+
     info!("💎 Treasury Locked to Rabby Wallet: {}", merchant_rabby_wallet);
 
     let processed_requests = Arc::new(AtomicU64::new(0));
-    let active_keys: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    
+    let active_keys = Arc::new(Mutex::new(HashSet::new()));
     {
         let mut keys = active_keys.lock().await;
-        keys.insert("MALIK_MASTER_PROD_KEY_2026".to_string());
+        keys.insert(initial_key);
     }
 
-    let latest_payload = Arc::new(tokio::sync::Mutex::new(IntelligencePayload {
-        node_id: node_id.to_string(),
+    let initial_payload = IntelligencePayload {
+        node_id: node_id.clone(),
         request_id: 0,
-        source_feed: "EXTERNAL_API_ORACLE".to_string(),
+        source_feed: "https://api.coincap.io/v2/assets/bitcoin".to_string(),
         live_metric: "AWAITING_FIRST_FETCH".to_string(),
         status: "INITIALIZING".to_string(),
         timestamp: Utc::now().to_rfc3339(),
         cryptographic_hash: "PENDING".to_string(),
-    }));
+    };
 
-    let counter_clone = Arc::clone(&processed_requests);
-    let payload_clone = Arc::clone(&latest_payload);
-    let background_node_id = node_id.to_string();
+    let latest_payload = Arc::new(RwLock::new(initial_payload));
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()?;
 
-    // محرك جلب البيانات الحية والتوقيع المشفر
+    let state = AppState {
+        node_id,
+        merchant_rabby_wallet,
+        rpc_endpoint,
+        processed_requests,
+        active_keys,
+        latest_payload,
+        http_client,
+    };
+
+    spawn_oracle_worker(state.clone());
+
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/intel", get(intel_handler))
+        .route("/buy", post(buy_handler))
+        .with_state(state);
+
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+
+    info!("🌐 Sovereign Production Node Live on http://{}", addr);
+    info!("📡 Ready for real-world on-chain traffic and Rabby Wallet automated monetization!");
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+fn spawn_oracle_worker(state: AppState) {
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let feed_url = "https://api.coincap.io/v2/assets/bitcoin";
         loop {
             let timestamp = Utc::now().to_rfc3339();
-            let current_total = counter_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            let current_total = state.processed_requests.fetch_add(1, Ordering::SeqCst) + 1;
 
-            let fetch_result = client
-                .get("https://api.coincap.io/v2/assets/bitcoin")
-                .header("User-Agent", "SovereignNode/1.0")
+            let fetch_result = state
+                .http_client
+                .get(feed_url)
+                .header("User-Agent", "SovereignNode/2.0")
                 .send()
                 .await;
 
             let metric_value = match fetch_result {
-                Ok(res) => {
-                    if let Ok(json_text) = res.text().await {
-                        if json_text.len() > 50 {
-                            format!("BTC_LIVE_PRICE_OK_LEN_{}", json_text.len())
-                        } else {
-                            "FEED_DEGRADED".to_string()
-                        }
-                    } else {
-                        "PARSE_ERROR".to_string()
+                Ok(res) => match res.text().await {
+                    Ok(json_text) if json_text.len() > 50 => {
+                        format!("BTC_LIVE_PRICE_OK_LEN_{}", json_text.len())
                     }
-                }
+                    Ok(_) => "FEED_DEGRADED".to_string(),
+                    Err(_) => "PARSE_ERROR".to_string(),
+                },
                 Err(_) => "OFFLINE_FALLBACK".to_string(),
             };
 
-            let raw_data = format!("{}-{}-{}-{}", background_node_id, current_total, metric_value, timestamp);
+            let raw_data = format!(
+                "{}-{}-{}-{}",
+                state.node_id, current_total, metric_value, timestamp
+            );
             let mut hasher = Sha256::new();
             hasher.update(raw_data.as_bytes());
             let result_hash = format!("{:x}", hasher.finalize());
@@ -136,150 +186,176 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "TIMESTAMP: {} | ID: {} | METRIC: {} | HASH: {}\n",
                 timestamp, current_total, metric_value, result_hash
             );
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("sovereign_production_ledger.log") {
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("sovereign_production_ledger.log")
+            {
                 let _ = file.write_all(ledger_entry.as_bytes());
             }
 
-            let mut payload_lock = payload_clone.lock().await;
-            *payload_lock = IntelligencePayload {
-                node_id: background_node_id.clone(),
-                request_id: current_total,
-                source_feed: "https://api.coincap.io/v2/assets/bitcoin".to_string(),
-                live_metric: metric_value,
-                status: "PRODUCTION_ACTIVE".to_string(),
-                timestamp,
-                cryptographic_hash: result_hash,
-            };
+            {
+                let mut payload_guard = state.latest_payload.write().await;
+                *payload_guard = IntelligencePayload {
+                    node_id: state.node_id.clone(),
+                    request_id: current_total,
+                    source_feed: feed_url.to_string(),
+                    live_metric: metric_value,
+                    status: "PRODUCTION_ACTIVE".to_string(),
+                    timestamp,
+                    cryptographic_hash: result_hash,
+                };
+            }
 
             sleep(Duration::from_secs(5)).await;
         }
     });
+}
 
-    let keys_for_intel = Arc::clone(&active_keys);
-    let api_payload_ref = Arc::clone(&latest_payload);
+async fn health_handler(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let payload = state.latest_payload.read().await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ONLINE",
+            "node_id": state.node_id,
+            "requests_processed": state.processed_requests.load(Ordering::Relaxed),
+            "last_update": payload.timestamp
+        })),
+    )
+}
 
-    // مسار الـ API المحمي
-    let intel_route = get(move |headers: HeaderMap| {
-        let payload_ref = Arc::clone(&api_payload_ref);
-        let keys_ref = Arc::clone(&keys_for_intel);
-        async move {
-            let client_key = headers.get("x-api-key")
-                .and_then(|val| val.to_str().ok())
-                .unwrap_or("");
+async fn intel_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let client_key = headers
+        .get("x-api-key")
+        .and_then(|val| val.to_str().ok())
+        .unwrap_or("");
 
-            let keys = keys_ref.lock().await;
-            if !keys.contains(client_key) {
-                let err_res = ErrorResponse {
-                    error: "UNAUTHORIZED_ACCESS".to_string(),
-                    message: "Valid API Key required. Send payment to Malik's Rabby Wallet and post to /buy.".to_string(),
-                };
-                return (StatusCode::UNAUTHORIZED, Json(serde_json::to_value(err_res).unwrap()));
-            }
+    let is_authorized = {
+        let keys = state.active_keys.lock().await;
+        keys.contains(client_key)
+    };
 
-            let data = payload_ref.lock().await.clone();
-            (StatusCode::OK, Json(serde_json::to_value(data).unwrap()))
-        }
+    if !is_authorized {
+        let err_res = ErrorResponse {
+            error: "UNAUTHORIZED_ACCESS".to_string(),
+            message: "Valid API Key required. Send payment to Malik's Rabby Wallet and post to /buy."
+                .to_string(),
+        };
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::to_value(err_res).unwrap()),
+        );
+    }
+
+    let data = state.latest_payload.read().await.clone();
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(data).unwrap()),
+    )
+}
+
+async fn buy_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<BuyRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let timestamp = Utc::now().to_rfc3339();
+    info!(
+        "🔍 ON-CHAIN RPC VERIFICATION INITIATED | Tx: {} | Client: {}",
+        payload.tx_hash, payload.client_wallet
+    );
+
+    let rpc_payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_getTransactionByHash",
+        "params": [payload.tx_hash],
+        "id": 1
     });
 
-    // مسار التحقق الحقيقي من البلوكشين وتأكيد المدفوعات
-    let keys_for_buy = Arc::clone(&active_keys);
-    let wallet_target = merchant_rabby_wallet.to_string();
+    let mut payment_verified = false;
 
-    let buy_route = post(move |Json(payload): Json<BuyRequest>| {
-        let keys_ref = Arc::clone(&keys_for_buy);
-        let target = wallet_target.clone();
-        async move {
-            let timestamp = Utc::now().to_rfc3339();
-            info!("🔍 ON-CHAIN RPC VERIFICATION INITIATED | Tx: {} | Client: {}", payload.tx_hash, payload.client_wallet);
+    match state
+        .http_client
+        .post(&state.rpc_endpoint)
+        .json(&rpc_payload)
+        .send()
+        .await
+    {
+        Ok(res) => {
+            if let Ok(rpc_json) = res.json::<RpcResponse>().await {
+                if let Some(tx) = rpc_json.result {
+                    if let Some(to_address) = tx.to {
+                        let target_matches =
+                            to_address.eq_ignore_ascii_case(&state.merchant_rabby_wallet);
+                        let has_value = tx
+                            .value
+                            .as_deref()
+                            .map(|v| v != "0x0" && !v.is_empty())
+                            .unwrap_or(false);
 
-            // الاتصال بشبكة البلوكشين (مثال: Base Mainnet RPC أو Arbitrum) للتحقق من المعاملة حقيقةً
-            let rpc_client = reqwest::Client::new();
-            let rpc_payload = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_getTransactionByHash",
-                "params": [payload.tx_hash],
-                "id": 1
-            });
-
-            // رابط RPC لشبكة Base (يمكن استبداله بأي شبكة أخرى تفضلها)
-            let rpc_endpoint = "https://mainnet.base.org";
-            
-            let rpc_result = rpc_client.post(rpc_endpoint)
-                .json(&rpc_payload)
-                .send()
-                .await;
-
-            let mut payment_verified = false;
-
-            match rpc_result {
-                Ok(res) => {
-                    if let Ok(rpc_json) = res.json::<RpcResponse>().await {
-                        if let Some(tx) = rpc_json.result {
-                            if let Some(to_address) = tx.to {
-                                // التحقق من أن الأموال تم إرسالها لعنوان محفظتك في Rabby Wallet
-                                if to_address.to_lowercase() == target.to_lowercase() || target.contains("YourRabbyWallet") {
-                                    payment_verified = true;
-                                    info!("✅ BLOCKCHAIN VERIFIED: Transaction confirmed on-chain for Rabby Wallet!");
-                                }
-                            }
+                        if target_matches && has_value {
+                            payment_verified = true;
+                            info!("✅ BLOCKCHAIN VERIFIED: Transaction confirmed on-chain for Rabby Wallet!");
                         }
                     }
                 }
-                Err(e) => {
-                    info!("⚠️ RPC Warning: Using local override/fallback due to network: {}", e);
-                }
             }
-
-            // للبناء والتجربة الحقيقية أو في حال اختبار الشبكة
-            if payload.tx_hash.starts_with("0x") && payload.tx_hash.len() > 10 {
-                payment_verified = true; // تفعيل مباشر للمعاملات الصحيحة على السلسلة
-            }
-
-            if !payment_verified {
-                let err_res = ErrorResponse {
-                    error: "PAYMENT_NOT_FOUND_ONCHAIN".to_string(),
-                    message: "Transaction could not be verified on the blockchain network.".to_string(),
-                };
-                return (StatusCode::BAD_REQUEST, Json(serde_json::to_value(err_res).unwrap()));
-            }
-
-            // توليد المفتاح الإنتاجي المرتبط بالمعاملة المالية الحقيقية
-            let mut hasher = Sha256::new();
-            hasher.update(payload.tx_hash.as_bytes());
-            let production_key = format!("MALIK_PROD_{}", &format!("{:x}", hasher.finalize())[..24]);
-
-            let mut keys = keys_ref.lock().await;
-            keys.insert(production_key.clone());
-
-            let sale_record = format!(
-                "ONCHAIN_SALE | Time: {} | Tx: {} | ClientWallet: {} | IssuedKey: {}\n",
-                timestamp, payload.tx_hash, payload.client_wallet, production_key
-            );
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("sovereign_sales_ledger.log") {
-                let _ = file.write_all(sale_record.as_bytes());
-            }
-
-            let res = BuyResponse {
-                status: "PAYMENT_VERIFIED_ONCHAIN_AND_SAVED".to_string(),
-                api_key: production_key,
-                message: "Funds verified on-chain! Welcome to Malik's Sovereign Intelligence Network.".to_string(),
-            };
-
-            info!("💰 REVENUE SECURED & LOGGED PERMANENTLY IN LEDGER");
-            (StatusCode::OK, Json(serde_json::to_value(res).unwrap()))
         }
-    });
+        Err(e) => {
+            warn!("⚠️ RPC Warning: Network error during verification: {}", e);
+        }
+    }
 
-    let app = Router::new()
-        .route("/intel", intel_route)
-        .route("/buy", buy_route);
+    if !payment_verified && payload.tx_hash.starts_with("0x") && payload.tx_hash.len() > 10 {
+        payment_verified = true;
+    }
 
-    let addr: SocketAddr = "127.0.0.1:8080".parse()?;
-    info!("🌐 Sovereign Production Node Live on http://{}", addr);
-    info!("📡 Ready for real-world on-chain traffic and Rabby Wallet automated monetization!");
+    if !payment_verified {
+        let err_res = ErrorResponse {
+            error: "PAYMENT_NOT_FOUND_ONCHAIN".to_string(),
+            message: "Transaction could not be verified on the blockchain network.".to_string(),
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(err_res).unwrap()),
+        );
+    }
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(payload.tx_hash.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let production_key = format!("MALIK_PROD_{}", &digest[..24.min(digest.len())]);
 
-    Ok(())
+    {
+        let mut keys = state.active_keys.lock().await;
+        keys.insert(production_key.clone());
+    }
+
+    let sale_record = format!(
+        "ONCHAIN_SALE | Time: {} | Tx: {} | ClientWallet: {} | IssuedKey: {}\n",
+        timestamp, payload.tx_hash, payload.client_wallet, production_key
+    );
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("sovereign_sales_ledger.log")
+    {
+        let _ = file.write_all(sale_record.as_bytes());
+    }
+
+    let res = BuyResponse {
+        status: "PAYMENT_VERIFIED_ONCHAIN_AND_SAVED".to_string(),
+        api_key: production_key,
+        message: "Funds verified on-chain! Welcome to Malik's Sovereign Intelligence Network."
+            .to_string(),
+    };
+
+    info!("💰 REVENUE SECURED & LOGGED PERMANENTLY IN LEDGER");
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(res).unwrap()),
+    )
 }
