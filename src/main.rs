@@ -1,7 +1,7 @@
-// src/main.rs - Sovereign Production-Grade Node with Real Blockchain RPC Verification
-use std::collections::HashSet;
+// src/main.rs - Final Hardened Sovereign Node (Strict RPC + Multi-Feed Intel + Key Persistence)
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +20,9 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+
+const KEYS_FILE: &str = "sovereign_active_keys.json";
+const USED_TX_FILE: &str = "sovereign_used_txs.json";
 
 #[derive(Serialize, Deserialize, Clone)]
 struct IntelligencePayload {
@@ -60,6 +63,7 @@ struct RpcResponse {
 struct TransactionDetails {
     to: Option<String>,
     value: Option<String>,
+    blockNumber: Option<String>,
 }
 
 #[derive(Clone)]
@@ -69,8 +73,32 @@ struct AppState {
     rpc_endpoint: String,
     processed_requests: Arc<AtomicU64>,
     active_keys: Arc<Mutex<HashSet<String>>>,
+    used_txs: Arc<Mutex<HashSet<String>>>,
     latest_payload: Arc<RwLock<IntelligencePayload>>,
     http_client: reqwest::Client,
+}
+
+fn load_set_from_disk(path: &str) -> HashSet<String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .map(|items| items.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn save_set_to_disk(path: &str, set: &HashSet<String>) {
+    let vec: Vec<String> = set.iter().cloned().collect();
+    if let Ok(json_str) = serde_json::to_string_pretty(&vec) {
+        let _ = fs::write(path, json_str);
+    }
+}
+
+fn parse_hex_u128(hex_str: &str) -> u128 {
+    let clean = hex_str.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if clean.is_empty() {
+        return 0;
+    }
+    u128::from_str_radix(clean, 16).unwrap_or(0)
 }
 
 #[tokio::main]
@@ -80,35 +108,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    info!("🚀 Booting Sovereign Production Node with Live Blockchain RPC Verification...");
+    info!("🚀 Booting Final Hardened Sovereign Node...");
 
-    // ضع عنوان محفظة Rabby الحقيقي هنا
     let merchant_rabby_wallet = std::env::var("MERCHANT_RABBY_WALLET")
-        .unwrap_or_else(|_| "0xYourRabbyWalletAddressHere_Malik".to_string());
+        .unwrap_or_else(|_| "0x78f4acb57f5aa14768018caf1fc9106ac56e52f4f92744bee5dc7c98f428dcbf".to_string());
 
     let node_id = std::env::var("NODE_ID")
         .unwrap_or_else(|_| "MALIK_SOVEREIGN_ORACLE_01".to_string());
 
     let rpc_endpoint = std::env::var("RPC_ENDPOINT")
-        .unwrap_or_else(|_| "https://mainnet.base.org".to_string());
+        .unwrap_or_else(|_| "https://arb1.arbitrum.io/rpc".to_string());
 
     let initial_key = std::env::var("MASTER_API_KEY")
         .unwrap_or_else(|_| "MALIK_MASTER_PROD_KEY_2026".to_string());
 
-    info!("💎 Treasury Locked to Rabby Wallet: {}", merchant_rabby_wallet);
+    info!("💎 Treasury Locked to Wallet: {}", merchant_rabby_wallet);
+    info!("🔗 RPC Endpoint Active: {}", rpc_endpoint);
 
     let processed_requests = Arc::new(AtomicU64::new(0));
-    let active_keys = Arc::new(Mutex::new(HashSet::new()));
-    {
-        let mut keys = active_keys.lock().await;
-        keys.insert(initial_key);
-    }
+
+    let mut keys_set = load_set_from_disk(KEYS_FILE);
+    keys_set.insert(initial_key);
+    save_set_to_disk(KEYS_FILE, &keys_set);
+    let active_keys = Arc::new(Mutex::new(keys_set));
+
+    let txs_set = load_set_from_disk(USED_TX_FILE);
+    let used_txs = Arc::new(Mutex::new(txs_set));
 
     let initial_payload = IntelligencePayload {
         node_id: node_id.clone(),
         request_id: 0,
-        source_feed: "https://api.coincap.io/v2/assets/bitcoin".to_string(),
-        live_metric: "AWAITING_FIRST_FETCH".to_string(),
+        source_feed: "multi-feed-btc-oracle".to_string(),
+        live_metric: "INITIALIZING_FEED".to_string(),
         status: "INITIALIZING".to_string(),
         timestamp: Utc::now().to_rfc3339(),
         cryptographic_hash: "PENDING".to_string(),
@@ -125,6 +156,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         rpc_endpoint,
         processed_requests,
         active_keys,
+        used_txs,
         latest_payload,
         http_client,
     };
@@ -141,7 +173,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
     info!("🌐 Sovereign Production Node Live on http://{}", addr);
-    info!("📡 Ready for real-world on-chain traffic and Rabby Wallet automated monetization!");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -149,30 +180,71 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+async fn fetch_btc_metric(client: &reqwest::Client) -> (String, String) {
+    // 1. CoinGecko simple price
+    if let Ok(res) = client
+        .get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+        .header("User-Agent", "SovereignOracle/3.0")
+        .send()
+        .await
+    {
+        if let Ok(json_val) = res.json::<serde_json::Value>().await {
+            if let Some(price) = json_val["bitcoin"]["usd"].as_f64() {
+                return (
+                    "https://api.coingecko.com/api/v3/simple/price".to_string(),
+                    format!("BTC_USD:{:.2}", price),
+                );
+            }
+        }
+    }
+
+    // 2. CoinCap fallback feed
+    if let Ok(res) = client
+        .get("https://api.coincap.io/v2/assets/bitcoin")
+        .header("User-Agent", "SovereignOracle/3.0")
+        .send()
+        .await
+    {
+        if let Ok(json_val) = res.json::<serde_json::Value>().await {
+            if let Some(price_str) = json_val["data"]["priceUsd"].as_str() {
+                return (
+                    "https://api.coincap.io/v2/assets/bitcoin".to_string(),
+                    format!("BTC_USD:{}", price_str),
+                );
+            }
+        }
+    }
+
+    // 3. Binance ticker fallback feed
+    if let Ok(res) = client
+        .get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
+        .header("User-Agent", "SovereignOracle/3.0")
+        .send()
+        .await
+    {
+        if let Ok(json_val) = res.json::<serde_json::Value>().await {
+            if let Some(price_str) = json_val["price"].as_str() {
+                return (
+                    "https://api.binance.com/api/v3/ticker/price".to_string(),
+                    format!("BTC_USDT:{}", price_str),
+                );
+            }
+        }
+    }
+
+    (
+        "multi-feed-btc-oracle".to_string(),
+        "FEED_UNAVAILABLE_RETRYING".to_string(),
+    )
+}
+
 fn spawn_oracle_worker(state: AppState) {
     tokio::spawn(async move {
-        let feed_url = "https://api.coincap.io/v2/assets/bitcoin";
         loop {
             let timestamp = Utc::now().to_rfc3339();
             let current_total = state.processed_requests.fetch_add(1, Ordering::SeqCst) + 1;
 
-            let fetch_result = state
-                .http_client
-                .get(feed_url)
-                .header("User-Agent", "SovereignNode/2.0")
-                .send()
-                .await;
-
-            let metric_value = match fetch_result {
-                Ok(res) => match res.text().await {
-                    Ok(json_text) if json_text.len() > 50 => {
-                        format!("BTC_LIVE_PRICE_OK_LEN_{}", json_text.len())
-                    }
-                    Ok(_) => "FEED_DEGRADED".to_string(),
-                    Err(_) => "PARSE_ERROR".to_string(),
-                },
-                Err(_) => "OFFLINE_FALLBACK".to_string(),
-            };
+            let (source_feed, metric_value) = fetch_btc_metric(&state.http_client).await;
 
             let raw_data = format!(
                 "{}-{}-{}-{}",
@@ -183,8 +255,8 @@ fn spawn_oracle_worker(state: AppState) {
             let result_hash = format!("{:x}", hasher.finalize());
 
             let ledger_entry = format!(
-                "TIMESTAMP: {} | ID: {} | METRIC: {} | HASH: {}\n",
-                timestamp, current_total, metric_value, result_hash
+                "TIMESTAMP: {} | ID: {} | SOURCE: {} | METRIC: {} | HASH: {}\n",
+                timestamp, current_total, source_feed, metric_value, result_hash
             );
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
@@ -199,7 +271,7 @@ fn spawn_oracle_worker(state: AppState) {
                 *payload_guard = IntelligencePayload {
                     node_id: state.node_id.clone(),
                     request_id: current_total,
-                    source_feed: feed_url.to_string(),
+                    source_feed,
                     live_metric: metric_value,
                     status: "PRODUCTION_ACTIVE".to_string(),
                     timestamp,
@@ -220,6 +292,7 @@ async fn health_handler(State(state): State<AppState>) -> (StatusCode, Json<serd
             "status": "ONLINE",
             "node_id": state.node_id,
             "requests_processed": state.processed_requests.load(Ordering::Relaxed),
+            "live_metric": payload.live_metric,
             "last_update": payload.timestamp
         })),
     )
@@ -242,7 +315,7 @@ async fn intel_handler(
     if !is_authorized {
         let err_res = ErrorResponse {
             error: "UNAUTHORIZED_ACCESS".to_string(),
-            message: "Valid API Key required. Send payment to Malik's Rabby Wallet and post to /buy."
+            message: "Valid API Key required. Send payment to Malik's Wallet and post to /buy."
                 .to_string(),
         };
         return (
@@ -263,60 +336,118 @@ async fn buy_handler(
     Json(payload): Json<BuyRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let timestamp = Utc::now().to_rfc3339();
+    let tx_normalized = payload.tx_hash.trim().to_lowercase();
+
+    if !tx_normalized.starts_with("0x") || tx_normalized.len() != 66 {
+        let err_res = ErrorResponse {
+            error: "INVALID_TX_HASH_FORMAT".to_string(),
+            message: "Transaction hash must be a valid 66-character 0x-prefixed hash.".to_string(),
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(err_res).unwrap()),
+        );
+    }
+
+    // Prevent double-spending the same tx_hash
+    {
+        let used = state.used_txs.lock().await;
+        if used.contains(&tx_normalized) {
+            let err_res = ErrorResponse {
+                error: "TX_HASH_ALREADY_USED".to_string(),
+                message: "This transaction hash has already been redeemed for an API key.".to_string(),
+            };
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::to_value(err_res).unwrap()),
+            );
+        }
+    }
+
     info!(
-        "🔍 ON-CHAIN RPC VERIFICATION INITIATED | Tx: {} | Client: {}",
-        payload.tx_hash, payload.client_wallet
+        "🔍 STRICT ON-CHAIN VERIFICATION | Tx: {} | Client: {}",
+        tx_normalized, payload.client_wallet
     );
 
     let rpc_payload = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "eth_getTransactionByHash",
-        "params": [payload.tx_hash],
+        "params": [tx_normalized],
         "id": 1
     });
 
-    let mut payment_verified = false;
-
-    match state
+    let rpc_res = match state
         .http_client
         .post(&state.rpc_endpoint)
         .json(&rpc_payload)
         .send()
         .await
     {
-        Ok(res) => {
-            if let Ok(rpc_json) = res.json::<RpcResponse>().await {
-                if let Some(tx) = rpc_json.result {
-                    if let Some(to_address) = tx.to {
-                        let target_matches =
-                            to_address.eq_ignore_ascii_case(&state.merchant_rabby_wallet);
-                        let has_value = tx
-                            .value
-                            .as_deref()
-                            .map(|v| v != "0x0" && !v.is_empty())
-                            .unwrap_or(false);
-
-                        if target_matches && has_value {
-                            payment_verified = true;
-                            info!("✅ BLOCKCHAIN VERIFIED: Transaction confirmed on-chain for Rabby Wallet!");
-                        }
-                    }
-                }
-            }
-        }
+        Ok(res) => res,
         Err(e) => {
-            warn!("⚠️ RPC Warning: Network error during verification: {}", e);
+            warn!("⚠️ RPC Network Error: {}", e);
+            let err_res = ErrorResponse {
+                error: "RPC_UNAVAILABLE".to_string(),
+                message: "Could not reach blockchain RPC endpoint to verify transaction.".to_string(),
+            };
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(err_res).unwrap()),
+            );
         }
-    }
+    };
 
-    if !payment_verified && payload.tx_hash.starts_with("0x") && payload.tx_hash.len() > 10 {
-        payment_verified = true;
-    }
+    let rpc_json = match rpc_res.json::<RpcResponse>().await {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warn!("⚠️ RPC Parse Error: {}", e);
+            let err_res = ErrorResponse {
+                error: "RPC_INVALID_RESPONSE".to_string(),
+                message: "Invalid response returned by blockchain RPC node.".to_string(),
+            };
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::to_value(err_res).unwrap()),
+            );
+        }
+    };
 
-    if !payment_verified {
+    let tx = match rpc_json.result {
+        Some(t) => t,
+        None => {
+            let err_res = ErrorResponse {
+                error: "PAYMENT_NOT_FOUND_ONCHAIN".to_string(),
+                message: "Transaction hash not found on the configured blockchain network.".to_string(),
+            };
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(err_res).unwrap()),
+            );
+        }
+    };
+
+    let to_matches = tx
+        .to
+        .as_deref()
+        .map(|addr| addr.eq_ignore_ascii_case(&state.merchant_rabby_wallet))
+        .unwrap_or(false);
+
+    let value_wei = tx
+        .value
+        .as_deref()
+        .map(parse_hex_u128)
+        .unwrap_or(0);
+
+    let is_mined = tx
+        .blockNumber
+        .as_deref()
+        .map(|bn| !bn.trim().is_empty() && bn.trim() != "0x0")
+        .unwrap_or(false);
+
+    if !to_matches || value_wei == 0 || !is_mined {
         let err_res = ErrorResponse {
-            error: "PAYMENT_NOT_FOUND_ONCHAIN".to_string(),
-            message: "Transaction could not be verified on the blockchain network.".to_string(),
+            error: "PAYMENT_VERIFICATION_FAILED".to_string(),
+            message: "Transaction must be mined on-chain, sent to the merchant wallet, and have value > 0.".to_string(),
         };
         return (
             StatusCode::BAD_REQUEST,
@@ -325,18 +456,25 @@ async fn buy_handler(
     }
 
     let mut hasher = Sha256::new();
-    hasher.update(payload.tx_hash.as_bytes());
+    hasher.update(tx_normalized.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
     let production_key = format!("MALIK_PROD_{}", &digest[..24.min(digest.len())]);
 
     {
         let mut keys = state.active_keys.lock().await;
         keys.insert(production_key.clone());
+        save_set_to_disk(KEYS_FILE, &keys);
+    }
+
+    {
+        let mut used = state.used_txs.lock().await;
+        used.insert(tx_normalized.clone());
+        save_set_to_disk(USED_TX_FILE, &used);
     }
 
     let sale_record = format!(
-        "ONCHAIN_SALE | Time: {} | Tx: {} | ClientWallet: {} | IssuedKey: {}\n",
-        timestamp, payload.tx_hash, payload.client_wallet, production_key
+        "ONCHAIN_SALE | Time: {} | Tx: {} | ValueWei: {} | ClientWallet: {} | IssuedKey: {}\n",
+        timestamp, tx_normalized, value_wei, payload.client_wallet, production_key
     );
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
@@ -346,14 +484,15 @@ async fn buy_handler(
         let _ = file.write_all(sale_record.as_bytes());
     }
 
+    info!("💰 VERIFIED ON-CHAIN PAYMENT | Wei: {} | Key Issued", value_wei);
+
     let res = BuyResponse {
         status: "PAYMENT_VERIFIED_ONCHAIN_AND_SAVED".to_string(),
         api_key: production_key,
-        message: "Funds verified on-chain! Welcome to Malik's Sovereign Intelligence Network."
+        message: "Verified on-chain payment! Welcome to Malik's Sovereign Intelligence Network."
             .to_string(),
     };
 
-    info!("💰 REVENUE SECURED & LOGGED PERMANENTLY IN LEDGER");
     (
         StatusCode::OK,
         Json(serde_json::to_value(res).unwrap()),
