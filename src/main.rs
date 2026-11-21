@@ -1,5 +1,5 @@
-// src/main.rs - Final Hardened Sovereign Node (Strict RPC + Multi-Feed Intel + Key Persistence)
-use std::collections::{HashMap, HashSet};
+// src/main.rs - Complete Hardened Sovereign Node (Resilient Multi-Feed + Strict RPC + Disk Persistence)
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -59,6 +59,7 @@ struct RpcResponse {
     result: Option<TransactionDetails>,
 }
 
+#[allow(non_snake_case)]
 #[derive(Deserialize, Debug)]
 struct TransactionDetails {
     to: Option<String>,
@@ -94,7 +95,10 @@ fn save_set_to_disk(path: &str, set: &HashSet<String>) {
 }
 
 fn parse_hex_u128(hex_str: &str) -> u128 {
-    let clean = hex_str.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let clean = hex_str
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
     if clean.is_empty() {
         return 0;
     }
@@ -110,8 +114,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("🚀 Booting Final Hardened Sovereign Node...");
 
-    let merchant_rabby_wallet = std::env::var("MERCHANT_RABBY_WALLET")
-        .unwrap_or_else(|_| "0x78f4acb57f5aa14768018caf1fc9106ac56e52f4f92744bee5dc7c98f428dcbf".to_string());
+    let merchant_rabby_wallet = std::env::var("MERCHANT_RABBY_WALLET").unwrap_or_else(|_| {
+        "0x78f4acb57f5aa14768018caf1fc9106ac56e52f4f92744bee5dc7c98f428dcbf".to_string()
+    });
 
     let node_id = std::env::var("NODE_ID")
         .unwrap_or_else(|_| "MALIK_SOVEREIGN_ORACLE_01".to_string());
@@ -181,44 +186,61 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn fetch_btc_metric(client: &reqwest::Client) -> (String, String) {
-    // 1. CoinGecko simple price
+    // 1. Coinbase Spot Price
     if let Ok(res) = client
-        .get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
-        .header("User-Agent", "SovereignOracle/3.0")
+        .get("https://api.coinbase.com/v2/prices/BTC-USD/spot")
+        .header("User-Agent", "Mozilla/5.0 SovereignOracle/3.1")
         .send()
         .await
     {
         if let Ok(json_val) = res.json::<serde_json::Value>().await {
-            if let Some(price) = json_val["bitcoin"]["usd"].as_f64() {
+            if let Some(price_str) = json_val["data"]["amount"].as_str() {
                 return (
-                    "https://api.coingecko.com/api/v3/simple/price".to_string(),
-                    format!("BTC_USD:{:.2}", price),
-                );
-            }
-        }
-    }
-
-    // 2. CoinCap fallback feed
-    if let Ok(res) = client
-        .get("https://api.coincap.io/v2/assets/bitcoin")
-        .header("User-Agent", "SovereignOracle/3.0")
-        .send()
-        .await
-    {
-        if let Ok(json_val) = res.json::<serde_json::Value>().await {
-            if let Some(price_str) = json_val["data"]["priceUsd"].as_str() {
-                return (
-                    "https://api.coincap.io/v2/assets/bitcoin".to_string(),
+                    "https://api.coinbase.com/v2/prices/BTC-USD/spot".to_string(),
                     format!("BTC_USD:{}", price_str),
                 );
             }
         }
     }
 
-    // 3. Binance ticker fallback feed
+    // 2. Kraken Ticker
+    if let Ok(res) = client
+        .get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD")
+        .header("User-Agent", "Mozilla/5.0 SovereignOracle/3.1")
+        .send()
+        .await
+    {
+        if let Ok(json_val) = res.json::<serde_json::Value>().await {
+            if let Some(price_str) = json_val["result"]["XXBTZUSD"]["c"][0].as_str() {
+                return (
+                    "https://api.kraken.com/0/public/Ticker?pair=XBTUSD".to_string(),
+                    format!("BTC_USD:{}", price_str),
+                );
+            }
+        }
+    }
+
+    // 3. CryptoCompare Price
+    if let Ok(res) = client
+        .get("https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD")
+        .header("User-Agent", "Mozilla/5.0 SovereignOracle/3.1")
+        .send()
+        .await
+    {
+        if let Ok(json_val) = res.json::<serde_json::Value>().await {
+            if let Some(price) = json_val["USD"].as_f64() {
+                return (
+                    "https://min-api.cryptocompare.com/data/price".to_string(),
+                    format!("BTC_USD:{:.2}", price),
+                );
+            }
+        }
+    }
+
+    // 4. Binance Ticker
     if let Ok(res) = client
         .get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-        .header("User-Agent", "SovereignOracle/3.0")
+        .header("User-Agent", "Mozilla/5.0 SovereignOracle/3.1")
         .send()
         .await
     {
@@ -325,10 +347,7 @@ async fn intel_handler(
     }
 
     let data = state.latest_payload.read().await.clone();
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(data).unwrap()),
-    )
+    (StatusCode::OK, Json(serde_json::to_value(data).unwrap()))
 }
 
 async fn buy_handler(
@@ -349,13 +368,13 @@ async fn buy_handler(
         );
     }
 
-    // Prevent double-spending the same tx_hash
     {
         let used = state.used_txs.lock().await;
         if used.contains(&tx_normalized) {
             let err_res = ErrorResponse {
                 error: "TX_HASH_ALREADY_USED".to_string(),
-                message: "This transaction hash has already been redeemed for an API key.".to_string(),
+                message: "This transaction hash has already been redeemed for an API key."
+                    .to_string(),
             };
             return (
                 StatusCode::CONFLICT,
@@ -388,7 +407,8 @@ async fn buy_handler(
             warn!("⚠️ RPC Network Error: {}", e);
             let err_res = ErrorResponse {
                 error: "RPC_UNAVAILABLE".to_string(),
-                message: "Could not reach blockchain RPC endpoint to verify transaction.".to_string(),
+                message: "Could not reach blockchain RPC endpoint to verify transaction."
+                    .to_string(),
             };
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -417,7 +437,8 @@ async fn buy_handler(
         None => {
             let err_res = ErrorResponse {
                 error: "PAYMENT_NOT_FOUND_ONCHAIN".to_string(),
-                message: "Transaction hash not found on the configured blockchain network.".to_string(),
+                message: "Transaction hash not found on the configured blockchain network."
+                    .to_string(),
             };
             return (
                 StatusCode::BAD_REQUEST,
@@ -432,11 +453,7 @@ async fn buy_handler(
         .map(|addr| addr.eq_ignore_ascii_case(&state.merchant_rabby_wallet))
         .unwrap_or(false);
 
-    let value_wei = tx
-        .value
-        .as_deref()
-        .map(parse_hex_u128)
-        .unwrap_or(0);
+    let value_wei = tx.value.as_deref().map(parse_hex_u128).unwrap_or(0);
 
     let is_mined = tx
         .blockNumber
@@ -447,7 +464,9 @@ async fn buy_handler(
     if !to_matches || value_wei == 0 || !is_mined {
         let err_res = ErrorResponse {
             error: "PAYMENT_VERIFICATION_FAILED".to_string(),
-            message: "Transaction must be mined on-chain, sent to the merchant wallet, and have value > 0.".to_string(),
+            message:
+                "Transaction must be mined on-chain, sent to the merchant wallet, and have value > 0."
+                    .to_string(),
         };
         return (
             StatusCode::BAD_REQUEST,
@@ -484,7 +503,10 @@ async fn buy_handler(
         let _ = file.write_all(sale_record.as_bytes());
     }
 
-    info!("💰 VERIFIED ON-CHAIN PAYMENT | Wei: {} | Key Issued", value_wei);
+    info!(
+        "💰 VERIFIED ON-CHAIN PAYMENT | Wei: {} | Key Issued",
+        value_wei
+    );
 
     let res = BuyResponse {
         status: "PAYMENT_VERIFIED_ONCHAIN_AND_SAVED".to_string(),
@@ -493,8 +515,5 @@ async fn buy_handler(
             .to_string(),
     };
 
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(res).unwrap()),
-    )
+    (StatusCode::OK, Json(serde_json::to_value(res).unwrap()))
 }
