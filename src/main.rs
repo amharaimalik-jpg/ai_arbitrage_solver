@@ -1,4 +1,4 @@
-// src/main.rs - Complete Hardened Sovereign Node (Resilient Multi-Feed + Strict RPC + Disk Persistence)
+// src/main.rs - All-in-One Sovereign Node (Min Payment + /info + Instant Client Portal on / + Strict RPC + Disk Persistence)
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
@@ -10,6 +10,7 @@ use std::sync::Arc;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
+    response::Html,
     routing::{get, post},
     Json, Router,
 };
@@ -72,6 +73,7 @@ struct AppState {
     node_id: String,
     merchant_rabby_wallet: String,
     rpc_endpoint: String,
+    min_payment_wei: u128,
     processed_requests: Arc<AtomicU64>,
     active_keys: Arc<Mutex<HashSet<String>>>,
     used_txs: Arc<Mutex<HashSet<String>>>,
@@ -112,7 +114,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    info!("🚀 Booting Final Hardened Sovereign Node...");
+    info!("🚀 Booting All-in-One Sovereign Node...");
 
     let merchant_rabby_wallet = std::env::var("MERCHANT_RABBY_WALLET").unwrap_or_else(|_| {
         "0x78f4acb57f5aa14768018caf1fc9106ac56e52f4f92744bee5dc7c98f428dcbf".to_string()
@@ -124,11 +126,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let rpc_endpoint = std::env::var("RPC_ENDPOINT")
         .unwrap_or_else(|_| "https://arb1.arbitrum.io/rpc".to_string());
 
+    let min_payment_wei: u128 = std::env::var("MIN_PAYMENT_WEI")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(100_000_000_000_000); // 0.0001 ETH default
+
     let initial_key = std::env::var("MASTER_API_KEY")
         .unwrap_or_else(|_| "MALIK_MASTER_PROD_KEY_2026".to_string());
 
     info!("💎 Treasury Locked to Wallet: {}", merchant_rabby_wallet);
     info!("🔗 RPC Endpoint Active: {}", rpc_endpoint);
+    info!("💰 Minimum Payment (WEI): {}", min_payment_wei);
 
     let processed_requests = Arc::new(AtomicU64::new(0));
 
@@ -159,6 +167,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         node_id,
         merchant_rabby_wallet,
         rpc_endpoint,
+        min_payment_wei,
         processed_requests,
         active_keys,
         used_txs,
@@ -169,6 +178,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     spawn_oracle_worker(state.clone());
 
     let app = Router::new()
+        .route("/", get(portal_handler))
+        .route("/info", get(info_handler))
         .route("/health", get(health_handler))
         .route("/intel", get(intel_handler))
         .route("/buy", post(buy_handler))
@@ -189,7 +200,7 @@ async fn fetch_btc_metric(client: &reqwest::Client) -> (String, String) {
     // 1. Coinbase Spot Price
     if let Ok(res) = client
         .get("https://api.coinbase.com/v2/prices/BTC-USD/spot")
-        .header("User-Agent", "Mozilla/5.0 SovereignOracle/3.1")
+        .header("User-Agent", "Mozilla/5.0 SovereignOracle/4.0")
         .send()
         .await
     {
@@ -206,7 +217,7 @@ async fn fetch_btc_metric(client: &reqwest::Client) -> (String, String) {
     // 2. Kraken Ticker
     if let Ok(res) = client
         .get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD")
-        .header("User-Agent", "Mozilla/5.0 SovereignOracle/3.1")
+        .header("User-Agent", "Mozilla/5.0 SovereignOracle/4.0")
         .send()
         .await
     {
@@ -223,7 +234,7 @@ async fn fetch_btc_metric(client: &reqwest::Client) -> (String, String) {
     // 3. CryptoCompare Price
     if let Ok(res) = client
         .get("https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD")
-        .header("User-Agent", "Mozilla/5.0 SovereignOracle/3.1")
+        .header("User-Agent", "Mozilla/5.0 SovereignOracle/4.0")
         .send()
         .await
     {
@@ -240,7 +251,7 @@ async fn fetch_btc_metric(client: &reqwest::Client) -> (String, String) {
     // 4. Binance Ticker
     if let Ok(res) = client
         .get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-        .header("User-Agent", "Mozilla/5.0 SovereignOracle/3.1")
+        .header("User-Agent", "Mozilla/5.0 SovereignOracle/4.0")
         .send()
         .await
     {
@@ -304,6 +315,116 @@ fn spawn_oracle_worker(state: AppState) {
             sleep(Duration::from_secs(5)).await;
         }
     });
+}
+
+async fn info_handler(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let min_eth = (state.min_payment_wei as f64) / 1e18;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "node_id": state.node_id,
+            "payment_wallet": state.merchant_rabby_wallet,
+            "min_payment_wei": state.min_payment_wei.to_string(),
+            "min_payment_eth_approx": format!("{:.6}", min_eth),
+            "endpoints": {
+                "portal": "GET /",
+                "info": "GET /info",
+                "health": "GET /health",
+                "buy": "POST /buy (body: {\"tx_hash\":\"0x...\",\"client_wallet\":\"0x...\"})",
+                "intel": "GET /intel (header: x-api-key: MALIK_PROD_...)"
+            }
+        })),
+    )
+}
+
+async fn portal_handler(State(state): State<AppState>) -> Html<String> {
+    let min_eth = (state.min_payment_wei as f64) / 1e18;
+    let html = format!(
+        r##"<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Malik Sovereign Oracle — بوابة الدفع والبيانات الحية</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, sans-serif; background:#0b0f17; color:#e6edf3; margin:0; padding:24px; }}
+    .wrap {{ max-width:760px; margin:0 auto; background:#131a26; border:1px solid #263248; border-radius:14px; padding:24px; }}
+    h1 {{ margin:0 0 8px; font-size:22px; color:#58a6ff; }}
+    .sub {{ color:#9fb0c7; margin:0 0 20px; font-size:14px; }}
+    .box {{ background:#0d131d; border:1px solid #222e42; border-radius:10px; padding:14px; margin-bottom:16px; }}
+    .label {{ font-size:12px; color:#8b9bb4; margin-bottom:6px; }}
+    .mono {{ font-family: monospace; word-break: break-all; font-size:13px; color:#7ee787; }}
+    input {{ width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid #2b3a55; background:#090d14; color:#fff; margin-bottom:10px; }}
+    button {{ background:#238636; color:#fff; border:0; padding:10px 16px; border-radius:8px; cursor:pointer; font-weight:600; }}
+    button.sec {{ background:#1f6feb; margin-right:8px; }}
+    pre {{ background:#090d14; border:1px solid #222e42; padding:12px; border-radius:8px; overflow:auto; font-size:12px; direction:ltr; text-align:left; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>⚡ {node_id}</h1>
+    <p class="sub">ادفع على الشبكة المعتمدة ثم فعّل مفتاح API واحصل على البيانات الموقّعة فوراً.</p>
+
+    <div class="box">
+      <div class="label">عنوان المحفظة المستقبلة للدفع</div>
+      <div class="mono" id="walletAddr">{wallet}</div>
+      <div class="label" style="margin-top:10px;">الحد الأدنى للدفع</div>
+      <div class="mono">{min_wei} wei (~{min_eth:.6} ETH)</div>
+    </div>
+
+    <div class="box">
+      <div class="label">1) شراء وتفعيل مفتاح API عبر POST /buy</div>
+      <input id="txHash" placeholder="tx_hash (0x... 66 chars)" />
+      <input id="clientWallet" placeholder="client_wallet (0x...)" />
+      <button onclick="buyKey()">تأكيد الدفع وإصدار المفتاح</button>
+    </div>
+
+    <div class="box">
+      <div class="label">2) قراءة البيانات الموقّعة عبر GET /intel</div>
+      <input id="apiKey" placeholder="x-api-key (MALIK_PROD_...)" />
+      <button class="sec" onclick="fetchIntel()">جلب /intel</button>
+      <button onclick="fetchHealth()">فحص /health</button>
+    </div>
+
+    <pre id="out">جاهز...</pre>
+  </div>
+
+  <script>
+    const out = document.getElementById('out');
+    async function buyKey() {{
+      out.textContent = 'جاري التحقق من المعاملة...';
+      const body = {{
+        tx_hash: document.getElementById('txHash').value.trim(),
+        client_wallet: document.getElementById('clientWallet').value.trim()
+      }};
+      const res = await fetch('/buy', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(body)
+      }});
+      const data = await res.json();
+      if (data.api_key) document.getElementById('apiKey').value = data.api_key;
+      out.textContent = JSON.stringify(data, null, 2);
+    }}
+    async function fetchIntel() {{
+      out.textContent = 'جاري جلب /intel...';
+      const key = document.getElementById('apiKey').value.trim();
+      const res = await fetch('/intel', {{ headers: {{ 'x-api-key': key }} }});
+      out.textContent = JSON.stringify(await res.json(), null, 2);
+    }}
+    async function fetchHealth() {{
+      const res = await fetch('/health');
+      out.textContent = JSON.stringify(await res.json(), null, 2);
+    }}
+  </script>
+</body>
+</html>"##,
+        node_id = state.node_id,
+        wallet = state.merchant_rabby_wallet,
+        min_wei = state.min_payment_wei,
+        min_eth = min_eth
+    );
+    Html(html)
 }
 
 async fn health_handler(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
@@ -374,146 +495,4 @@ async fn buy_handler(
             let err_res = ErrorResponse {
                 error: "TX_HASH_ALREADY_USED".to_string(),
                 message: "This transaction hash has already been redeemed for an API key."
-                    .to_string(),
-            };
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::to_value(err_res).unwrap()),
-            );
-        }
-    }
-
-    info!(
-        "🔍 STRICT ON-CHAIN VERIFICATION | Tx: {} | Client: {}",
-        tx_normalized, payload.client_wallet
-    );
-
-    let rpc_payload = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "eth_getTransactionByHash",
-        "params": [tx_normalized],
-        "id": 1
-    });
-
-    let rpc_res = match state
-        .http_client
-        .post(&state.rpc_endpoint)
-        .json(&rpc_payload)
-        .send()
-        .await
-    {
-        Ok(res) => res,
-        Err(e) => {
-            warn!("⚠️ RPC Network Error: {}", e);
-            let err_res = ErrorResponse {
-                error: "RPC_UNAVAILABLE".to_string(),
-                message: "Could not reach blockchain RPC endpoint to verify transaction."
-                    .to_string(),
-            };
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::to_value(err_res).unwrap()),
-            );
-        }
-    };
-
-    let rpc_json = match rpc_res.json::<RpcResponse>().await {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            warn!("⚠️ RPC Parse Error: {}", e);
-            let err_res = ErrorResponse {
-                error: "RPC_INVALID_RESPONSE".to_string(),
-                message: "Invalid response returned by blockchain RPC node.".to_string(),
-            };
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::to_value(err_res).unwrap()),
-            );
-        }
-    };
-
-    let tx = match rpc_json.result {
-        Some(t) => t,
-        None => {
-            let err_res = ErrorResponse {
-                error: "PAYMENT_NOT_FOUND_ONCHAIN".to_string(),
-                message: "Transaction hash not found on the configured blockchain network."
-                    .to_string(),
-            };
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::to_value(err_res).unwrap()),
-            );
-        }
-    };
-
-    let to_matches = tx
-        .to
-        .as_deref()
-        .map(|addr| addr.eq_ignore_ascii_case(&state.merchant_rabby_wallet))
-        .unwrap_or(false);
-
-    let value_wei = tx.value.as_deref().map(parse_hex_u128).unwrap_or(0);
-
-    let is_mined = tx
-        .blockNumber
-        .as_deref()
-        .map(|bn| !bn.trim().is_empty() && bn.trim() != "0x0")
-        .unwrap_or(false);
-
-    if !to_matches || value_wei == 0 || !is_mined {
-        let err_res = ErrorResponse {
-            error: "PAYMENT_VERIFICATION_FAILED".to_string(),
-            message:
-                "Transaction must be mined on-chain, sent to the merchant wallet, and have value > 0."
-                    .to_string(),
-        };
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::to_value(err_res).unwrap()),
-        );
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(tx_normalized.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    let production_key = format!("MALIK_PROD_{}", &digest[..24.min(digest.len())]);
-
-    {
-        let mut keys = state.active_keys.lock().await;
-        keys.insert(production_key.clone());
-        save_set_to_disk(KEYS_FILE, &keys);
-    }
-
-    {
-        let mut used = state.used_txs.lock().await;
-        used.insert(tx_normalized.clone());
-        save_set_to_disk(USED_TX_FILE, &used);
-    }
-
-    let sale_record = format!(
-        "ONCHAIN_SALE | Time: {} | Tx: {} | ValueWei: {} | ClientWallet: {} | IssuedKey: {}\n",
-        timestamp, tx_normalized, value_wei, payload.client_wallet, production_key
-    );
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("sovereign_sales_ledger.log")
-    {
-        let _ = file.write_all(sale_record.as_bytes());
-    }
-
-    info!(
-        "💰 VERIFIED ON-CHAIN PAYMENT | Wei: {} | Key Issued",
-        value_wei
-    );
-
-    let res = BuyResponse {
-        status: "PAYMENT_VERIFIED_ONCHAIN_AND_SAVED".to_string(),
-        api_key: production_key,
-        message: "Verified on-chain payment! Welcome to Malik's Sovereign Intelligence Network."
-            .to_string(),
-    };
-
-    (StatusCode::OK, Json(serde_json::to_value(res).unwrap()))
-}
+                    .
