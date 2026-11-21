@@ -1,4 +1,4 @@
-// src/main.rs - Sovereign Production-Grade Node with Real Blockchain RPC Verification
+    1// src/main.rs - Sovereign Production-Grade Node with Real Blockchain RPC Verification
 use std::error::Error;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
